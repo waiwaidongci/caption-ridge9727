@@ -28,3 +28,13 @@ class ScheduleRequest(RunRequest):
     recipient: str = Field(min_length=1, max_length=100)
     first_at: datetime
     repeat_daily: bool = False
+
+class TrialRequest(Request):
+    name: str = Field(min_length=1, max_length=120)
+    dataset_id: int = Field(gt=0)
+    old_scheme_key: str = Field(min_length=1, max_length=40)
+    new_scheme_key: str = Field(min_length=1, max_length=40)
+    round_sizes: list[int] = Field(min_length=2, max_length=2)
+
+class BackfillRequest(Request):
+    rows: list[dict] = Field(min_length=1, max_length=5000)

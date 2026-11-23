@@ -15,6 +15,15 @@ _GROUPS = (
     ("时长、转写与术语", _TRANSCRIPT + ("term_count",)),
 )
 _LABELS = {field["key"]: field["label"] for field in SPEC["fields"]}
+# 试跑可选的已完成方案：三个特征组各配三个惩罚档，共九个口径。
+SCHEMES = tuple(
+    {"key": f"g{group_index + 1}-p{penalty_index + 1}", "group": name,
+     "features": list(features), "penalty": penalty,
+     "label": f"{name} · λ={penalty:g}"}
+    for group_index, (name, features) in enumerate(_GROUPS)
+    for penalty_index, penalty in enumerate((0.1, 1, 10))
+)
+_SCHEME_BY_KEY = {item["key"]: item for item in SCHEMES}
 
 
 def validate_rows(rows):
@@ -133,13 +142,29 @@ def _candidates(training, selection, center):
     return sorted(scores, key=lambda item: (item[0], item[1], len(item[3]), -item[4]))
 
 
-def _pending_estimates(model, pending, last_history_date, threshold):
+def _pending_estimates(model, pending, last_history_date, threshold, deployment=None, enrolled=()):
+    """生成待审队列。
+
+    deployment 给出试跑后生效的冻结方案：达标后新工单改用生效方案；已入组试跑的
+    工单（enrolled 中的 job_id）预测照旧，沿用本次回测模型，不被方案切换改动。
+    """
+    enrolled = set(enrolled)
     queue = []
     for row in pending:
-        prediction = model.predict(row)
+        active_model = model
+        estimate_source = "本次回测模型"
+        if deployment and row["job_id"] not in enrolled:
+            active_model = _Model(
+                tuple(deployment["model"]["features"]), deployment["model"]["means"],
+                deployment["model"]["scales"], deployment["model"]["weights"],
+                [tuple(pair) for pair in deployment["model"]["bounds"]],
+                deployment["model"]["intercept"],
+            )
+            estimate_source = f"试跑生效方案：{deployment['scheme']['label']}"
+        prediction = active_model.predict(row)
         estimate = round(max(0.0, prediction), 2)
         outside = [
-            _LABELS[key] for key, (low, high) in zip(model.features, model.bounds)
+            _LABELS[key] for key, (low, high) in zip(active_model.features, active_model.bounds)
             if not low <= row[key] <= high
         ]
         reasons = []
@@ -155,6 +180,7 @@ def _pending_estimates(model, pending, last_history_date, threshold):
             "job_id": row["job_id"], "job_date": row["job_date"], "title": row["title"],
             "estimated_minutes": estimate, "flagged": "需核排" if reasons else "常规",
             "reason": "。".join(reasons) if reasons else "—",
+            "estimate_source": estimate_source,
         })
     return sorted(queue, key=lambda row: (row["flagged"] != "需核排", -row["estimated_minutes"], row["job_date"], row["job_id"]))
 
@@ -163,7 +189,7 @@ def _table(title, columns, rows):
     return {"title": title, "columns": [{"key": key, "label": label} for key, label in columns], "rows": rows}
 
 
-def analyze(rows, normalized_params):
+def analyze(rows, normalized_params, deployment=None, enrolled_job_ids=()):
     from src.services.validation import normalize_params
 
     ordered = sorted(validate_rows(rows), key=lambda row: (row["job_date"], row["job_id"]))
@@ -176,7 +202,8 @@ def analyze(rows, normalized_params):
     model = _fit(training + selection, features, penalty)
     mae, rmse, bias = _errors(model, holdout)
     baseline = fmean(abs(row["actual_minutes"] - model.intercept) for row in holdout)
-    queue = _pending_estimates(model, pending, history[-1]["job_date"], params["flag_minutes"])
+    queue = _pending_estimates(model, pending, history[-1]["job_date"], params["flag_minutes"],
+                               deployment=deployment, enrolled=enrolled_job_ids)
     flagged = sum(row["flagged"] == "需核排" for row in queue)
 
     comparison = [
@@ -205,7 +232,8 @@ def analyze(rows, normalized_params):
     identifiers = (("job_id", "工单号"), ("job_date", "工单日期"), ("title", "讲座标题"))
     tables = [
         _table("待审工时与核排清单", identifiers + (
-            ("estimated_minutes", "估算分钟"), ("flagged", "排班标记"), ("reason", "标记原因")), queue),
+            ("estimated_minutes", "估算分钟"), ("estimate_source", "估算口径"),
+            ("flagged", "排班标记"), ("reason", "标记原因")), queue),
         _table("选型集候选比较", (("group", "特征组"), ("penalty", "λ"), ("mae", "MAE（分钟）"),
                                 ("rmse", "RMSE（分钟）"), ("selected", "选型结论")), comparison),
         _table("留出集逐单误差", identifiers + (("estimated_minutes", "估算分钟"), ("actual_minutes", "实耗分钟"),
@@ -240,3 +268,36 @@ def analyze(rows, normalized_params):
                      "标准差小于 10⁻¹² 的列按恒定列处理。核排时优先查看标记原因和原始工单。"),
         }],
     }
+
+
+def get_scheme(scheme_key):
+    """按 key 返回试跑可选的已完成方案口径。"""
+    try:
+        return _SCHEME_BY_KEY[scheme_key]
+    except KeyError:
+        raise ValueError("未知估算方案，请重新打开试跑面板") from None
+
+
+def fit_scheme(history, scheme_key):
+    """用全部已完工工单拟合指定方案，返回冻结后的可序列化模型。"""
+    scheme = get_scheme(scheme_key)
+    fitted = _fit(history, tuple(scheme["features"]), scheme["penalty"])
+    return {
+        "scheme_key": scheme_key,
+        "features": list(fitted.features),
+        "means": fitted.means,
+        "scales": fitted.scales,
+        "weights": fitted.weights,
+        "bounds": [list(pair) for pair in fitted.bounds],
+        "intercept": fitted.intercept,
+    }
+
+
+def predict_frozen(frozen_model, row):
+    """用冻结模型复算单条工单估算（最低为零），与试跑创建时口径一致。"""
+    model = _Model(
+        tuple(frozen_model["features"]), frozen_model["means"], frozen_model["scales"],
+        frozen_model["weights"], [tuple(pair) for pair in frozen_model["bounds"]],
+        frozen_model["intercept"],
+    )
+    return round(max(0.0, model.predict(row)), 2)

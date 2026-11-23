@@ -7,7 +7,9 @@ from src.domain.analysis import analyze
 from src.domain.spec import SPEC
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
+from src.models.trial import TrialEnrollment
 from src.services.audit import record
+from src.services.trials import active_deployment
 from src.utils.exports import write_report
 from src.utils.time import now
 
@@ -65,7 +67,17 @@ def execute(lease):
     job_id, attempt, rows, params = lease
     result = export = failure = None
     try:
-        result = analyze(rows, params)
+        with Session() as db:
+            deployment_item = active_deployment(db)
+            deployment = None if not deployment_item else {
+                "scheme_key": deployment_item.scheme_key,
+                "scheme": deployment_item.scheme,
+                "model": deployment_item.model,
+            }
+            enrolled = set(db.scalars(select(TrialEnrollment.job_id)).all()) if deployment_item else set()
+        result = analyze(rows, params, deployment=deployment, enrolled_job_ids=enrolled)
+        if deployment_item:
+            result["note"] += f" 方案试跑已采用「{deployment_item.scheme['label']}」，新工单按生效方案估算，已入组试跑工单预测照旧。"
         export = write_report(job_id, attempt, result)
     except ValueError as error:
         failure = str(error)[:500]
